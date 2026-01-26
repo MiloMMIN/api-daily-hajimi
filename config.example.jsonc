@@ -1,0 +1,26 @@
+{
+  // schedule.mode 可选值:
+  // - "interval": 按固定间隔执行（使用 schedule.interval_seconds）
+  // - "time_of_day": 每天固定时间执行（使用 schedule.time_of_day，格式 "HH:MM"）
+  "schedule": {
+    // 是否启用定时常驻调度；false 时程序仅运行一次就退出
+    "enabled": true,
+
+    // 默认启动后先立刻跑一次；第二次开始再按 interval / time_of_day 调度
+    "run_immediately_on_start": true,
+
+    // "interval" 或 "time_of_day"
+    "mode": "interval",
+
+    // mode=interval 时生效：间隔秒数（默认 86400 = 1 天）
+    "interval_seconds": 86400,
+
+    // mode=time_of_day 时生效：每天运行时间（24 小时制）
+    "time_of_day": "03:30"
+  },
+
+  "run": {
+    // 每个账号之间暂停秒数（避免风控）
+    "between_accounts_seconds": 2
+  }
+}

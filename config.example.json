@@ -1,0 +1,12 @@
+{
+  "schedule": {
+    "enabled": true,
+    "run_immediately_on_start": true,
+    "mode": "interval",
+    "interval_seconds": 86400,
+    "time_of_day": "03:30"
+  },
+  "run": {
+    "between_accounts_seconds": 2
+  }
+}

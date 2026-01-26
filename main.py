@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from playwright.async_api import async_playwright
 
 # 配置信息
@@ -73,6 +73,88 @@ def format_final_report(results):
         lines.append(f"- {status} | {username} | {detail}")
 
     return "\n".join(lines)
+
+def load_config():
+    defaults = {
+        "schedule": {
+            "enabled": True,
+            "run_immediately_on_start": True,
+            "mode": "interval",
+            "interval_seconds": 86400,
+            "time_of_day": "03:30",
+        },
+        "run": {
+            "between_accounts_seconds": 2,
+        },
+    }
+
+    def load_json_with_optional_comments(file_path: str):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except Exception:
+            return None
+
+        lines = []
+        for line in raw.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("//") or stripped.startswith("#"):
+                continue
+            lines.append(line)
+        filtered = "\n".join(lines).strip()
+        if not filtered:
+            return {}
+
+        try:
+            return json.loads(filtered) or {}
+        except Exception:
+            return None
+
+    user_cfg = None
+    if os.path.exists("config.json"):
+        user_cfg = load_json_with_optional_comments("config.json")
+    if user_cfg is None and os.path.exists("config.jsonc"):
+        user_cfg = load_json_with_optional_comments("config.jsonc")
+    if user_cfg is None:
+        return defaults
+
+    def deep_merge(base, override):
+        if not isinstance(base, dict) or not isinstance(override, dict):
+            return override
+        merged = dict(base)
+        for k, v in override.items():
+            if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+                merged[k] = deep_merge(merged[k], v)
+            else:
+                merged[k] = v
+        return merged
+
+    return deep_merge(defaults, user_cfg)
+
+def compute_next_run_at(now: datetime, schedule_cfg: dict):
+    mode = (schedule_cfg or {}).get("mode", "interval")
+    if mode == "time_of_day":
+        time_of_day = (schedule_cfg or {}).get("time_of_day", "03:30")
+        try:
+            hour_str, minute_str = str(time_of_day).split(":", 1)
+            hour = int(hour_str)
+            minute = int(minute_str)
+        except Exception:
+            hour, minute = 3, 30
+
+        next_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_at <= now:
+            next_at = next_at + timedelta(days=1)
+        return next_at
+
+    interval_seconds = (schedule_cfg or {}).get("interval_seconds", 86400)
+    try:
+        interval_seconds = int(interval_seconds)
+    except Exception:
+        interval_seconds = 86400
+    if interval_seconds < 1:
+        interval_seconds = 1
+    return now + timedelta(seconds=interval_seconds)
 
 async def run_sign_in(account):
     username = account.get("username")
@@ -160,27 +242,33 @@ async def run_sign_in(account):
 
         return {"ok": ok, "username": username, "detail": detail}
 
-async def main():
+async def run_once(config: dict):
     if not os.path.exists("accounts.json"):
         print("错误: 未找到 accounts.json 配置文件。")
-        return
+        return []
         
     with open("accounts.json", "r", encoding="utf-8") as f:
         try:
             accounts = json.load(f)
         except Exception as e:
             print(f"错误: 无法解析 accounts.json。请检查格式。{e}")
-            return
+            return []
     
     print(f"共发现 {len(accounts)} 个账号，准备开始自动签到任务...")
     results = []
+    between_accounts_seconds = (config or {}).get("run", {}).get("between_accounts_seconds", 2)
+    try:
+        between_accounts_seconds = float(between_accounts_seconds)
+    except Exception:
+        between_accounts_seconds = 2
     
     for account in accounts:
         result = await run_sign_in(account)
         results.append(result)
 
         # 账号之间稍微停顿
-        await asyncio.sleep(2)
+        if between_accounts_seconds > 0:
+            await asyncio.sleep(between_accounts_seconds)
     
     report = format_final_report(results)
     webhook_result = await send_wechat_webhook(report)
@@ -188,6 +276,29 @@ async def main():
         print(f"Webhook 发送失败: {webhook_result}")
 
     print("\n所有账号签到任务已完成。")
+    return results
+
+async def main():
+    config = load_config()
+    schedule_cfg = (config or {}).get("schedule", {})
+    if not schedule_cfg.get("enabled", True):
+        await run_once(config)
+        return
+
+    if schedule_cfg.get("run_immediately_on_start", True):
+        await run_once(config)
+
+    while True:
+        now = datetime.now()
+        next_at = compute_next_run_at(now, schedule_cfg)
+        wait_seconds = (next_at - now).total_seconds()
+        if wait_seconds < 0:
+            wait_seconds = 0
+
+        next_str = next_at.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n下一次运行时间: {next_str}，等待 {int(wait_seconds)} 秒...")
+        await asyncio.sleep(wait_seconds)
+        await run_once(config)
 
 if __name__ == "__main__":
     asyncio.run(main())
