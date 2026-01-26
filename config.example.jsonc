@@ -19,6 +19,14 @@
     "time_of_day": "03:30"
   },
 
+  "webhook": {
+    // 是否启用企业微信机器人通知
+    "enabled": true,
+
+    // 企业微信机器人 Webhook 地址（请填写你自己的；不要提交真实地址到公开仓库）
+    "url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
+  },
+
   "run": {
     // 每个账号之间暂停秒数（避免风控）
     "between_accounts_seconds": 2

@@ -9,25 +9,38 @@ from playwright.async_api import async_playwright
 BASE_URL = "https://api.gemai.cc"
 LOGIN_URL = f"{BASE_URL}/login"
 PERSONAL_URL = f"{BASE_URL}/console/personal"
-WEBHOOK_URL = os.getenv(
-    "WECHAT_WEBHOOK_URL",
-    "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=78ff6c36-f371-49db-b08f-dd1a08289db3",
-)
 
-async def send_wechat_webhook(content: str):
-    if os.getenv("WECHAT_WEBHOOK_ENABLED", "1") == "0":
+def get_webhook_config(config: dict):
+    webhook_cfg = (config or {}).get("webhook", {}) or {}
+    enabled = webhook_cfg.get("enabled", True)
+    url = webhook_cfg.get("url")
+
+    if os.getenv("WECHAT_WEBHOOK_ENABLED") is not None:
+        enabled = os.getenv("WECHAT_WEBHOOK_ENABLED", "1") != "0"
+    if os.getenv("WECHAT_WEBHOOK_URL"):
+        url = os.getenv("WECHAT_WEBHOOK_URL")
+
+    dry_run = os.getenv("WECHAT_WEBHOOK_DRY_RUN", "0") == "1"
+    return {"enabled": bool(enabled), "url": url, "dry_run": dry_run}
+
+async def send_wechat_webhook(content: str, webhook_config: dict):
+    if not (webhook_config or {}).get("enabled", True):
+        return {"ok": False, "disabled": True}
+
+    webhook_url = (webhook_config or {}).get("url")
+    if not webhook_url:
         return {"ok": False, "disabled": True}
 
     payload = {"msgtype": "text", "text": {"content": content}}
 
-    if os.getenv("WECHAT_WEBHOOK_DRY_RUN", "0") == "1":
+    if (webhook_config or {}).get("dry_run"):
         print(f"[webhook dry-run]\n{content}")
         return {"ok": True, "dry_run": True}
 
     def _post():
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            WEBHOOK_URL,
+            webhook_url,
             data=data,
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
@@ -271,7 +284,8 @@ async def run_once(config: dict):
             await asyncio.sleep(between_accounts_seconds)
     
     report = format_final_report(results)
-    webhook_result = await send_wechat_webhook(report)
+    webhook_cfg = get_webhook_config(config)
+    webhook_result = await send_wechat_webhook(report, webhook_cfg)
     if not webhook_result.get("ok") and not webhook_result.get("disabled"):
         print(f"Webhook 发送失败: {webhook_result}")
 

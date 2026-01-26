@@ -6,6 +6,10 @@
     "interval_seconds": 86400,
     "time_of_day": "03:30"
   },
+  "webhook": {
+    "enabled": true,
+    "url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
+  },
   "run": {
     "between_accounts_seconds": 2
   }
