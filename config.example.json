@@ -10,6 +10,13 @@
     "enabled": true,
     "url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
   },
+  "browser": {
+    "headless": true,
+    "proxy": null,
+    "launch_timeout_ms": 60000,
+    "action_timeout_ms": 30000,
+    "navigation_timeout_ms": 45000
+  },
   "run": {
     "between_accounts_seconds": 2
   }

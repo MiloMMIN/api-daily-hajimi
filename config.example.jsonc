@@ -27,6 +27,27 @@
     "url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_KEY"
   },
 
+  "browser": {
+    // headless=true 更省资源；但部分站点对无头更敏感，可尝试切换
+    "headless": true,
+
+    // 服务器机房 IP 容易触发风控时，可以配置代理（例如住宅代理）
+    // "proxy": { "server": "http://host:port", "username": "u", "password": "p" }
+    "proxy": null,
+
+    // 调试用：记录关键网络请求与控制台错误到 artifacts/*.log
+    "debug_network": false,
+
+    // 语言与时区（避免部分站点差异行为）
+    "locale": "zh-CN",
+    "timezone_id": "Asia/Shanghai",
+
+    // 超时配置（毫秒）
+    "launch_timeout_ms": 60000,
+    "action_timeout_ms": 30000,
+    "navigation_timeout_ms": 45000
+  },
+
   "run": {
     // 每个账号之间暂停秒数（避免风控）
     "between_accounts_seconds": 2

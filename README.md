@@ -76,10 +76,20 @@ python main.py
 docker build -t api-daily:latest .
 ```
 
+### 国内网络加速（推荐）
+如果国内拉取 `mcr.microsoft.com` 很慢，可以改用 `Dockerfile.cn`（基于 Docker Hub 的 `python` 镜像，并内置 Playwright 下载镜像源）：
+
+```bash
+docker build -f Dockerfile.cn -t api-daily:cn .
+```
+
+后续运行时把镜像名替换为 `api-daily:cn` 即可。
+
 运行（把本地 `accounts.json` 与 `config.jsonc` 挂载到容器内）：
 
 ```bash
 docker run -d --name api-daily \
+  --ipc=host \
   -e TZ=Asia/Shanghai \
   -v "$(pwd)/accounts.json:/app/accounts.json:ro" \
   -v "$(pwd)/config.jsonc:/app/config.jsonc:ro" \

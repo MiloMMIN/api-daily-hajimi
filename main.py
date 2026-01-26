@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import urllib.request
 from datetime import datetime, timedelta
 from playwright.async_api import async_playwright
@@ -96,6 +97,16 @@ def load_config():
             "interval_seconds": 86400,
             "time_of_day": "03:30",
         },
+        "browser": {
+            "headless": True,
+            "launch_timeout_ms": 60000,
+            "action_timeout_ms": 30000,
+            "navigation_timeout_ms": 45000,
+            "locale": "zh-CN",
+            "timezone_id": os.getenv("TZ"),
+            "debug_network": False,
+            "proxy": None,
+        },
         "run": {
             "between_accounts_seconds": 2,
         },
@@ -169,24 +180,170 @@ def compute_next_run_at(now: datetime, schedule_cfg: dict):
         interval_seconds = 1
     return now + timedelta(seconds=interval_seconds)
 
-async def run_sign_in(account):
+def get_chromium_launch_args():
+    args = []
+
+    is_linux = os.name == "posix"
+    is_docker = False
+    try:
+        is_docker = os.path.exists("/.dockerenv")
+    except Exception:
+        is_docker = False
+
+    if is_linux:
+        args.append("--disable-dev-shm-usage")
+
+        try:
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                args.append("--no-sandbox")
+        except Exception:
+            pass
+
+        if is_docker:
+            args.append("--disable-gpu")
+
+    return args
+
+def _safe_filename_part(value: str):
+    s = (value or "").strip()
+    if not s:
+        return "empty"
+    s = re.sub(r"[^\w\.\-@]+", "_", s, flags=re.UNICODE)
+    return s[:80] if len(s) > 80 else s
+
+def _ensure_dir(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+def _parse_proxy(proxy_cfg):
+    if not proxy_cfg:
+        return None
+    if isinstance(proxy_cfg, str):
+        return {"server": proxy_cfg}
+    if isinstance(proxy_cfg, dict):
+        server = proxy_cfg.get("server")
+        if not server:
+            return None
+        parsed = {"server": server}
+        if proxy_cfg.get("username"):
+            parsed["username"] = str(proxy_cfg.get("username"))
+        if proxy_cfg.get("password"):
+            parsed["password"] = str(proxy_cfg.get("password"))
+        return parsed
+    return None
+
+async def run_sign_in(account, config: dict):
     username = account.get("username")
     password = account.get("password")
     if not username or not password:
         return {"ok": False, "username": username, "detail": "账号或密码为空，请检查 accounts.json"}
     
+    browser_cfg = (config or {}).get("browser", {}) or {}
+    headless = browser_cfg.get("headless", True)
+    proxy = _parse_proxy(browser_cfg.get("proxy"))
+    launch_timeout_ms = browser_cfg.get("launch_timeout_ms", 60000)
+    action_timeout_ms = browser_cfg.get("action_timeout_ms", 30000)
+    navigation_timeout_ms = browser_cfg.get("navigation_timeout_ms", 45000)
+    locale = browser_cfg.get("locale", "zh-CN")
+    timezone_id = browser_cfg.get("timezone_id", os.getenv("TZ"))
+    debug_network = bool(browser_cfg.get("debug_network", False))
+    try:
+        launch_timeout_ms = int(launch_timeout_ms)
+    except Exception:
+        launch_timeout_ms = 60000
+    try:
+        action_timeout_ms = int(action_timeout_ms)
+    except Exception:
+        action_timeout_ms = 30000
+    try:
+        navigation_timeout_ms = int(navigation_timeout_ms)
+    except Exception:
+        navigation_timeout_ms = 45000
+
     async with async_playwright() as p:
         # 启动浏览器
         # 使用 headless=True 以便在无界面环境下运行
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={'width': 1280, 'height': 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        browser = await p.chromium.launch(
+            headless=bool(headless),
+            args=get_chromium_launch_args(),
+            timeout=launch_timeout_ms,
+            proxy=proxy,
         )
+        context_kwargs = {
+            "viewport": {"width": 1280, "height": 800},
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+        if locale:
+            context_kwargs["locale"] = str(locale)
+        if timezone_id:
+            context_kwargs["timezone_id"] = str(timezone_id)
+
+        context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
+        page.set_default_timeout(action_timeout_ms)
+        page.set_default_navigation_timeout(navigation_timeout_ms)
         
         ok = False
         detail = ""
+
+        artifacts_dir = "artifacts"
+        _ensure_dir(artifacts_dir)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name_part = _safe_filename_part(username)
+        network_log_path = os.path.join(artifacts_dir, f"{ts}_{name_part}_network.log")
+        network_events = []
+
+        def append_network_event(kind: str, message: str):
+            if not debug_network:
+                return
+            try:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                network_events.append(f"{now_str} {kind} {message}")
+            except Exception:
+                pass
+
+        def flush_network_log():
+            if not debug_network:
+                return None
+            try:
+                content = "\n".join(network_events)
+                with open(network_log_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                return network_log_path
+            except Exception:
+                return None
+
+        if debug_network:
+            page.on("console", lambda msg: append_network_event("console", f"{msg.type} {msg.text}"))
+            page.on("pageerror", lambda exc: append_network_event("pageerror", str(exc)))
+            page.on("requestfailed", lambda req: append_network_event("requestfailed", f"{req.method} {req.url} {req.failure}"))
+            page.on(
+                "response",
+                lambda res: append_network_event(
+                    "response",
+                    f"{res.status} {res.request.method} {res.url}",
+                )
+                if ("/api/" in res.url or "/login" in res.url or "/console" in res.url)
+                else None,
+            )
+
+        async def dump_artifacts(tag: str):
+            tag_part = _safe_filename_part(tag)
+            png_path = os.path.join(artifacts_dir, f"{ts}_{name_part}_{tag_part}.png")
+            html_path = os.path.join(artifacts_dir, f"{ts}_{name_part}_{tag_part}.html")
+            try:
+                await page.screenshot(path=png_path, full_page=True)
+            except Exception:
+                pass
+            try:
+                html = await page.content()
+                await asyncio.to_thread(lambda: open(html_path, "w", encoding="utf-8").write(html))
+            except Exception:
+                pass
+            log_path = flush_network_log()
+            return {"png": png_path, "html": html_path, "log": log_path, "url": getattr(page, "url", "")}
 
         try:
             print(f"正在尝试登录账号: {username}...")
@@ -199,20 +356,63 @@ async def run_sign_in(account):
             await page.fill("input[name='username']", username)
             await page.fill("input[name='password']", password)
             
-            # 点击登录按钮
-            # Hajimi API / New API 使用 '继续' 或 '登录'
-            login_btn = page.locator("button:has-text('继续'), button:has-text('登录'), button:has-text('登 录')").first
-            await login_btn.click()
+            async def click_login_button():
+                candidates = [
+                    "button:has-text('继续'), button:has-text('登录'), button:has-text('登 录')",
+                    "button:has-text('Continue'), button:has-text('Sign in'), button:has-text('Log in')",
+                    "[role='button']:has-text('继续'), [role='button']:has-text('登录'), [role='button']:has-text('登 录')",
+                    "[role='button']:has-text('Continue'), [role='button']:has-text('Sign in'), [role='button']:has-text('Log in')",
+                    "a:has-text('继续'), a:has-text('登录'), a:has-text('登 录')",
+                    "a:has-text('Continue'), a:has-text('Sign in'), a:has-text('Log in')",
+                    "text=继续, text=登录, text=登 录, text=Continue, text=Sign in, text=Log in",
+                ]
+
+                for selector in candidates:
+                    loc = page.locator(selector).first
+                    try:
+                        await loc.wait_for(state="visible", timeout=5000)
+                        await loc.click(timeout=15000)
+                        return {"ok": True, "selector": selector}
+                    except Exception:
+                        continue
+
+                try:
+                    btn = page.get_by_role(
+                        "button",
+                        name=re.compile(r"(继续|登录|登\s*录|Continue|Sign\s*in|Log\s*in)", re.I),
+                    ).first
+                    await btn.click(timeout=15000)
+                    return {"ok": True, "selector": "get_by_role(button, name~...)"}
+                except Exception:
+                    pass
+
+                try:
+                    await page.press("input[name='password']", "Enter")
+                    return {"ok": True, "selector": "press_enter"}
+                except Exception:
+                    return {"ok": False, "selector": None}
+
+            click_result = await click_login_button()
+            if not click_result.get("ok"):
+                artifacts = await dump_artifacts("login_button_missing")
+                raise RuntimeError(f"未找到可点击的登录按钮（可能页面结构变化/风控/人机验证）。{artifacts}")
             
             # 等待进入控制台
             try:
                 await page.wait_for_url(lambda url: "/console" in url, timeout=20000)
             except Exception:
                 print(f"等待跳转超时，当前 URL: {page.url}")
+                if "/login" in page.url:
+                    artifacts = await dump_artifacts("login_not_redirected")
+                    raise RuntimeError(f"登录后未跳转到控制台，疑似未登录成功/被风控。{artifacts}")
             
             # 直接前往个人中心（签到功能所在页）
             print(f"前往个人中心签到页面...")
             await page.goto(PERSONAL_URL)
+
+            if "/login" in page.url:
+                artifacts = await dump_artifacts("redirected_to_login")
+                raise RuntimeError(f"访问个人中心被重定向到登录页，疑似未登录成功/被风控。{artifacts}")
             
             # 等待签到按钮出现
             # 按钮可能显示 '每日签到' 或 '今日已签到'
@@ -236,21 +436,18 @@ async def run_sign_in(account):
             except Exception as e:
                 print(f"账号 {username}: 未能找到签到按钮或执行失败。错误: {str(e)}")
                 ok = False
-                detail = f"未找到签到按钮或执行失败：{str(e)}"
+                artifacts = await dump_artifacts("checkin_failed")
+                detail = f"未找到签到按钮或执行失败：{str(e)}。{artifacts}"
             
             # 由于每个账号都会关闭浏览器并开启新实例，因此无需执行复杂的退出逻辑
             print(f"账号 {username} 任务处理完毕。")
             
         except Exception as e:
             print(f"账号 {username} 执行过程中出错: {str(e)}")
-            # 截图保存错误现场
-            try:
-                await page.screenshot(path=f"error_{username}.png")
-            except Exception:
-                pass
             ok = False
             detail = str(e)
         finally:
+            flush_network_log()
             await browser.close()
 
         return {"ok": ok, "username": username, "detail": detail}
@@ -276,7 +473,7 @@ async def run_once(config: dict):
         between_accounts_seconds = 2
     
     for account in accounts:
-        result = await run_sign_in(account)
+        result = await run_sign_in(account, config)
         results.append(result)
 
         # 账号之间稍微停顿
