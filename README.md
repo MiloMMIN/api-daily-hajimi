@@ -1,23 +1,26 @@
 # api.gemai.cc 多账号自动签到（Python + Playwright）
 
-基于 Playwright 的浏览器自动化脚本：依次登录多个账号，执行签到动作，并在结束后退出登录。适用于 SPA 页面场景。
+基于 Playwright 的浏览器自动化脚本：依次登录多个账号，执行签到动作，采集账户统计数据，并在结束后退出登录。适用于 SPA 页面场景。
 
 ## 功能
-- 多账号轮询：从 `accounts.json` 读取账号列表并逐个执行
-- 自动化流程：登录 → 进入控制台/个人中心 → 尝试点击“签到” → 退出登录
-- 失败留痕：异常时保存截图 `error_<username>.png`
-- 风控友好：账号之间默认等待 2 秒（可配置）
-- 运行通知：可选企业微信机器人 Webhook 推送执行结果（可配置）
-- 定时执行：支持按间隔或每天固定时间自动运行（可配置）
+- **多账号轮询**：从 `accounts.json` 读取账号列表并逐个执行
+- **自动化流程**：登录 → 进入控制台/个人中心 → 尝试点击“签到” → 采集账户数据（余额/消耗/请求数） → 退出登录
+- **数据采集**：自动抓取账户余额、历史消耗、请求次数并汇总到通知中
+- **失败留痕**：异常时保存截图 `error_<username>.png` 和网络日志
+- **风控友好**：账号之间默认等待 2 秒（可配置）
+- **运行通知**：可选企业微信机器人 Webhook 推送执行结果（可配置）
+- **定时执行**：支持按间隔或每天固定时间自动运行（可配置）
+- **低内存模式**：Docker 模式下采用 Shell 脚本调度，空闲时几乎不占用内存
 
 ## 目录
 - `main.py`：主脚本（Playwright 异步 API）
+- `entrypoint.sh`：调度脚本（用于 Docker 环境低内存运行）
 - `accounts.json`：账号配置（请勿提交到公开仓库）
 - `accounts.example.json`：账号配置模板（可提交）
 - `requirements.txt`：Python 依赖
 - `config.jsonc`：本地运行配置（支持注释；请勿提交到公开仓库）
 - `config.example.jsonc`：带注释的配置模板（可提交）
-- `Dockerfile`：基础容器构建文件
+- `Dockerfile` / `Dockerfile.cn`：容器构建文件
 
 ## 环境要求
 - Python 3.8+（建议 3.10+）
@@ -70,32 +73,44 @@ python main.py
 建议把真实账号文件排除在版本控制之外，避免泄露。
 
 ## Docker（服务器运行）
-构建镜像：
+
+本项目的 Docker 镜像经过特殊优化，使用 Shell 脚本作为调度器，在空闲等待时几乎不消耗内存（<1MB），仅在执行任务时启动 Python 进程。
+
+### 1. 构建镜像
+
+**推荐：国内网络加速版**
+基于 Docker Hub 的 `python` 镜像，并内置 Playwright 国内下载源：
 
 ```bash
-docker build -t api-daily:latest .
+docker build -f Dockerfile.cn -t api-daily .
 ```
 
-### 国内网络加速（推荐）
-如果国内拉取 `mcr.microsoft.com` 很慢，可以改用 `Dockerfile.cn`（基于 Docker Hub 的 `python` 镜像，并内置 Playwright 下载镜像源）：
+或者使用普通版（基于官方 Python 镜像）：
 
 ```bash
-docker build -f Dockerfile.cn -t api-daily:cn .
+docker build -t api-daily .
 ```
 
-后续运行时把镜像名替换为 `api-daily:cn` 即可。
+### 2. 运行容器
 
-运行（把本地 `accounts.json` 与 `config.jsonc` 挂载到容器内）：
+请确保 `accounts.json` 和 `config.jsonc` 已经存在于当前目录。
 
 ```bash
-docker run -d --name api-daily \
+docker run -d \
+  --name api-daily \
   --ipc=host \
-  -e TZ=Asia/Shanghai \
-  -v "$(pwd)/accounts.json:/app/accounts.json:ro" \
-  -v "$(pwd)/config.jsonc:/app/config.jsonc:ro" \
   --restart unless-stopped \
-  api-daily:latest
+  -e TZ=Asia/Shanghai \
+  -v "$(pwd)/accounts.json:/app/accounts.json" \
+  -v "$(pwd)/config.jsonc:/app/config.jsonc" \
+  -v "$(pwd)/artifacts:/app/artifacts" \
+  api-daily
 ```
+
+**参数说明：**
+*   `--ipc=host`: **必须添加**。Chromium 在 Docker 中运行时需要共享内存，否则容易崩溃。
+*   `-v .../artifacts:/app/artifacts`: 挂载运行产物目录，方便查看报错截图和日志。
+*   `--restart unless-stopped`: 容器退出或重启后自动恢复运行。
 
 ## 国内镜像（Playwright 浏览器下载加速）
 Playwright 首次使用需要下载浏览器（Chromium/Firefox/WebKit），国内网络可能较慢。可设置镜像下载源：
@@ -128,7 +143,7 @@ python -m playwright install chromium
 ```
 
 ### 需要调试页面元素
-将 `main.py` 中 `headless=True` 改为 `False`，即可看到浏览器界面便于定位元素。
+将 `config.jsonc` 中 `browser.headless` 改为 `false`，即可看到浏览器界面便于定位元素。
 
 ## 说明
 - 页面若出现强人机验证/风控，可能需要手动处理一次或调整等待与定位逻辑
