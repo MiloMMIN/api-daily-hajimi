@@ -2,9 +2,10 @@ import asyncio
 import json
 import os
 import re
+import sys
+import subprocess
 import urllib.request
 from datetime import datetime, timedelta
-from playwright.async_api import async_playwright
 
 # 配置信息
 BASE_URL = "https://api.gemai.cc"
@@ -270,6 +271,8 @@ async def run_sign_in(account, config: dict):
         navigation_timeout_ms = int(navigation_timeout_ms)
     except Exception:
         navigation_timeout_ms = 45000
+
+    from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
         # 启动浏览器
@@ -553,27 +556,61 @@ async def run_once(config: dict):
     print("\n所有账号签到任务已完成。")
     return results
 
+import argparse
+
+# ... (Previous imports)
+
+# ... (Functions: get_webhook_config, send_wechat_webhook, format_final_report, load_config, compute_next_run_at, etc.)
+
 async def main():
-    config = load_config()
-    schedule_cfg = (config or {}).get("schedule", {})
-    if not schedule_cfg.get("enabled", True):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--worker", action="store_true", help="Run the sign-in worker immediately")
+    parser.add_argument("--next-run", action="store_true", help="Calculate seconds until next run")
+    parser.add_argument("--startup", action="store_true", help="Indicate this is the startup check")
+    args = parser.parse_args()
+
+    # 1. Worker 模式：执行具体的签到任务
+    if args.worker:
+        config = load_config()
         await run_once(config)
         return
 
-    if schedule_cfg.get("run_immediately_on_start", True):
-        await run_once(config)
+    # 2. Next Run 模式：计算下一次运行的等待秒数
+    if args.next_run:
+        config = load_config()
+        schedule_cfg = (config or {}).get("schedule", {})
+        
+        # 如果未开启调度，返回特殊值（比如 -1 或极大值），让 Shell 脚本决定
+        # 这里我们假设未开启调度就只运行一次（在 startup 时），或者永不运行
+        if not schedule_cfg.get("enabled", True):
+            # 如果是启动时检查，且未开启调度，可能需要运行一次
+            # 但通常 enabled=False 意味着完全手动。
+            # 这里简单返回一个极大的等待时间，相当于暂停
+            print("8640000") 
+            return
 
-    while True:
+        # 检查是否需要立即运行
+        if args.startup and schedule_cfg.get("run_immediately_on_start", True):
+            print("0")
+            return
+
         now = datetime.now()
         next_at = compute_next_run_at(now, schedule_cfg)
         wait_seconds = (next_at - now).total_seconds()
+        
         if wait_seconds < 0:
             wait_seconds = 0
+            
+        print(f"{int(wait_seconds)}")
+        return
 
-        next_str = next_at.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n下一次运行时间: {next_str}，等待 {int(wait_seconds)} 秒...")
-        await asyncio.sleep(wait_seconds)
-        await run_once(config)
+    # 默认行为：如果什么参数都没传，为了兼容旧习惯，也可以默认运行一次 worker
+    # 或者打印帮助
+    config = load_config()
+    await run_once(config)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
