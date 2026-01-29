@@ -119,6 +119,8 @@ def load_config():
         },
         "run": {
             "between_accounts_seconds": 2,
+            "max_retries": 3,
+            "retry_delay_seconds": 300,
         },
     }
 
@@ -369,55 +371,102 @@ async def run_sign_in(account, config: dict):
             await page.fill("input[name='username']", username)
             await page.fill("input[name='password']", password)
             
+            # 检查并勾选用户协议（如果有）
+            try:
+                # 策略1: 查找 input[type='checkbox']
+                # 使用 force=True 即使被隐藏也能操作，不检查 visibility
+                checkbox = page.locator("input[type='checkbox']").first
+                if await checkbox.count() > 0:
+                    if not await checkbox.is_checked():
+                        print("检测到协议复选框，正在强制勾选...")
+                        await checkbox.check(force=True)
+                        await asyncio.sleep(0.5)
+
+                # 策略2: 点击 "我已阅读并同意" 文本
+                # 双重保险：如果策略1没生效（例如自定义组件未绑定 input），点击文本通常能触发 toggle
+                label = page.locator("text=我已阅读并同意").first
+                if await label.is_visible():
+                    print("尝试点击协议文本以确保勾选...")
+                    await label.click()
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"勾选协议尝试时忽略错误: {e}")
+
             async def click_login_button():
+                # 优先寻找表单内的提交按钮，避免点击到 Header 栏的 "登录" 链接
                 candidates = [
-                    "button:has-text('继续'), button:has-text('登录'), button:has-text('登 录')",
-                    "button:has-text('Continue'), button:has-text('Sign in'), button:has-text('Log in')",
-                    "[role='button']:has-text('继续'), [role='button']:has-text('登录'), [role='button']:has-text('登 录')",
-                    "[role='button']:has-text('Continue'), [role='button']:has-text('Sign in'), [role='button']:has-text('Log in')",
-                    "a:has-text('继续'), a:has-text('登录'), a:has-text('登 录')",
-                    "a:has-text('Continue'), a:has-text('Sign in'), a:has-text('Log in')",
-                    "text=继续, text=登录, text=登 录, text=Continue, text=Sign in, text=Log in",
+                    # 1. 明确的提交按钮
+                    "button[type='submit']",
+                    # 2. 表单内的按钮
+                    "form button:has-text('登录')",
+                    "form button:has-text('Continue')",
+                    # 3. 排除 Header/Nav 的按钮 (通常 Header 按钮是 tertiary/borderless)
+                    "button:not([class*='borderless']):has-text('登录')",
+                    "button:not([class*='borderless']):has-text('Continue')",
+                    # 4. 原有的一般性策略 (放在最后)
+                    "button:has-text('登录')",
+                    "button:has-text('Sign in')",
                 ]
 
                 for selector in candidates:
-                    loc = page.locator(selector).first
                     try:
-                        await loc.wait_for(state="visible", timeout=5000)
-                        await loc.click(timeout=15000)
-                        return {"ok": True, "selector": selector}
+                        loc = page.locator(selector).first
+                        if await loc.is_visible():
+                            # 检查是否被禁用（通常是因为未勾选协议）
+                            if await loc.is_disabled():
+                                print(f"发现登录按钮 ({selector}) 但被禁用，尝试再次勾选协议...")
+                                # 再次尝试勾选协议
+                                await page.locator("input[type='checkbox']").first.check(force=True)
+                                await asyncio.sleep(0.5)
+                            
+                            print(f"尝试点击登录按钮: {selector}")
+                            await loc.click(timeout=5000)
+                            return {"ok": True, "selector": selector}
                     except Exception:
                         continue
-
-                try:
-                    btn = page.get_by_role(
-                        "button",
-                        name=re.compile(r"(继续|登录|登\s*录|Continue|Sign\s*in|Log\s*in)", re.I),
-                    ).first
-                    await btn.click(timeout=15000)
-                    return {"ok": True, "selector": "get_by_role(button, name~...)"}
-                except Exception:
-                    pass
-
+                
+                # 如果上面的都失败了，尝试盲点 Enter
                 try:
                     await page.press("input[name='password']", "Enter")
                     return {"ok": True, "selector": "press_enter"}
                 except Exception:
-                    return {"ok": False, "selector": None}
+                    pass
+
+                return {"ok": False, "selector": None}
 
             click_result = await click_login_button()
             if not click_result.get("ok"):
                 artifacts = await dump_artifacts("login_button_missing")
                 raise RuntimeError(f"未找到可点击的登录按钮（可能页面结构变化/风控/人机验证）。{artifacts}")
             
-            # 等待进入控制台
+            # 等待不再是登录页（因为登录后可能停留在任意页面）
             try:
-                await page.wait_for_url(lambda url: "/console" in url, timeout=20000)
+                await page.wait_for_url(lambda url: "/login" not in url, timeout=20000)
             except Exception:
                 print(f"等待跳转超时，当前 URL: {page.url}")
                 if "/login" in page.url:
-                    artifacts = await dump_artifacts("login_not_redirected")
-                    raise RuntimeError(f"登录后未跳转到控制台，疑似未登录成功/被风控。{artifacts}")
+                    artifacts = await dump_artifacts("login_stuck")
+                    raise RuntimeError(f"登录后停留在登录页，可能登录失败。{artifacts}")
+            
+            # 尝试关闭系统公告弹窗
+            try:
+                # 常见的弹窗关闭按钮选择器
+                close_selectors = [
+                    "button[aria-label='Close']",
+                    "button.ant-modal-close",
+                    "button:has-text('我知道了')",
+                    "button:has-text('关闭')", 
+                    ".dialog-close"
+                ]
+                for sel in close_selectors:
+                    # 使用 or_ 组合多个定位器可能会比较慢，这里简单循环检测
+                    # 设置较短的 timeout，避免浪费时间
+                    if await page.locator(sel).first.is_visible(timeout=2000):
+                        print(f"检测到弹窗，尝试关闭 ({sel})...")
+                        await page.locator(sel).first.click()
+                        await asyncio.sleep(0.5)
+            except Exception:
+                pass
             
             # 直接前往个人中心（签到功能所在页）
             print(f"前往个人中心签到页面...")
@@ -458,13 +507,20 @@ async def run_sign_in(account, config: dict):
                 await page.goto(TOPUP_URL)
                 # 等待页面加载
                 await page.wait_for_selector("text=账户统计", timeout=15000)
-                await page.wait_for_timeout(2000) # 等待数据渲染
+                await page.wait_for_timeout(3000) # 等待AJAX数据加载完成
 
                 async def get_stat(label):
                     try:
                         # 查找包含特定文本的元素
                         # 使用 exact=True 避免匹配到其他包含该词的文本
                         el = page.get_by_text(label, exact=True).first
+                        
+                        # 增加重试等待，防止元素虽然渲染了但内容还在加载
+                        for _ in range(3):
+                            if await el.is_visible():
+                                break
+                            await asyncio.sleep(1)
+                            
                         if not await el.is_visible():
                             print(f"未找到可见的标签: {label}")
                             return "N/A"
@@ -472,22 +528,19 @@ async def run_sign_in(account, config: dict):
                         # 尝试向上查找父级容器，直到找到包含数值的层级
                         # 通常结构是：容器 -> [数值, 标签] 或 容器 -> [子容器(数值), 子容器(标签)]
                         current = el
-                        for i in range(3): # 最多向上查找3层
+                        for i in range(4): # 增加向上查找层级
                             parent = current.locator("..")
                             text = await parent.inner_text()
                             # 简单的文本处理：按行分割，排除掉标签本身
                             lines = [line.strip() for line in text.splitlines() if line.strip()]
                             
-                            # 如果只有一行且就是标签本身，说明还需要往上找
-                            if len(lines) == 1 and label in lines[0]:
-                                current = parent
-                                continue
-                            
-                            # 找到多行，或者单行但不止包含标签
                             # 过滤掉标签文本
                             values = [l for l in lines if label not in l]
-                            if values:
-                                return values[0] # 返回第一个非标签的文本行
+                            
+                            # 简单的数值检查：如果包含 ¥ 或 数字，更有可能是目标值
+                            for v in values:
+                                if "¥" in v or re.search(r'\d', v):
+                                    return v
                             
                             # 如果还没有找到，继续往上
                             current = parent
@@ -532,20 +585,65 @@ async def run_once(config: dict):
             return []
     
     print(f"共发现 {len(accounts)} 个账号，准备开始自动签到任务...")
-    results = []
-    between_accounts_seconds = (config or {}).get("run", {}).get("between_accounts_seconds", 2)
+    
+    run_cfg = (config or {}).get("run", {})
+    between_accounts_seconds = run_cfg.get("between_accounts_seconds", 2)
+    max_retries = run_cfg.get("max_retries", 3)
+    retry_delay_seconds = run_cfg.get("retry_delay_seconds", 300)
+
     try:
         between_accounts_seconds = float(between_accounts_seconds)
     except Exception:
         between_accounts_seconds = 2
-    
-    for account in accounts:
-        result = await run_sign_in(account, config)
-        results.append(result)
 
-        # 账号之间稍微停顿
-        if between_accounts_seconds > 0:
-            await asyncio.sleep(between_accounts_seconds)
+    try:
+        max_retries = int(max_retries)
+        if max_retries < 0: max_retries = 0
+    except Exception:
+        max_retries = 3
+
+    try:
+        retry_delay_seconds = int(retry_delay_seconds)
+        if retry_delay_seconds < 0: retry_delay_seconds = 300
+    except Exception:
+        retry_delay_seconds = 300
+    
+    final_results = {}
+    pending_accounts = list(accounts)
+
+    for attempt in range(max_retries + 1):
+        if not pending_accounts:
+            break
+        
+        if attempt > 0:
+            print(f"\n[重试机制] 等待 {retry_delay_seconds} 秒后开始第 {attempt}/{max_retries} 次重试...")
+            await asyncio.sleep(retry_delay_seconds)
+            print(f"开始第 {attempt} 次重试，剩余 {len(pending_accounts)} 个账号...")
+
+        next_pending = []
+        for account in pending_accounts:
+            username = account.get("username")
+            # 已经成功的不再跑
+            if final_results.get(username, {}).get("ok"):
+                continue
+
+            result = await run_sign_in(account, config)
+            
+            # 更新结果（覆盖旧的失败结果，或保留新的成功结果）
+            final_results[username] = result
+
+            if not result.get("ok"):
+                next_pending.append(account)
+            
+            if between_accounts_seconds > 0:
+                await asyncio.sleep(between_accounts_seconds)
+        
+        pending_accounts = next_pending
+        if not pending_accounts:
+            print("所有账号均执行成功，无需重试。")
+            break
+
+    results = list(final_results.values())
     
     report = format_final_report(results)
     webhook_cfg = get_webhook_config(config)

@@ -50,6 +50,12 @@
 
   "run": {
     // 每个账号之间暂停秒数（避免风控）
-    "between_accounts_seconds": 2
+    "between_accounts_seconds": 2,
+
+    // 失败重试次数（0 为不重试）
+    "max_retries": 3,
+
+    // 重试前等待秒数（建议 60~300 秒，等待风控冷却或网络恢复）
+    "retry_delay_seconds": 300
   }
 }
