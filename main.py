@@ -372,23 +372,38 @@ async def run_sign_in(account, config: dict):
             await page.fill("input[name='password']", password)
             
             # 检查并勾选用户协议（如果有）
+            checkbox = page.locator("input[type='checkbox']").first
+            label = page.locator("text=我已阅读并同意").first
+            
             try:
                 # 策略1: 查找 input[type='checkbox']
-                # 使用 force=True 即使被隐藏也能操作，不检查 visibility
-                checkbox = page.locator("input[type='checkbox']").first
                 if await checkbox.count() > 0:
                     if not await checkbox.is_checked():
                         print("检测到协议复选框，正在强制勾选...")
                         await checkbox.check(force=True)
+                        # 补充：尝试触发 click 事件，某些框架可能监听 click 而不是 change
+                        # 针对 Semi UI 等框架，尝试点击 checkbox 的父级容器或视觉元素
+                        try:
+                            if not await checkbox.is_checked():
+                                # 尝试点击 Semi UI 的视觉元素
+                                semi_inner = page.locator(".semi-checkbox-inner").first
+                                if await semi_inner.is_visible():
+                                    await semi_inner.click()
+                                else:
+                                    await checkbox.click(force=True)
+                        except Exception:
+                            pass
                         await asyncio.sleep(0.5)
 
                 # 策略2: 点击 "我已阅读并同意" 文本
                 # 双重保险：如果策略1没生效（例如自定义组件未绑定 input），点击文本通常能触发 toggle
                 label = page.locator("text=我已阅读并同意").first
                 if await label.is_visible():
-                    print("尝试点击协议文本以确保勾选...")
-                    await label.click()
-                    await asyncio.sleep(0.5)
+                    # 检查 checkbox 是否已勾选（如果能找到的话）
+                    if await checkbox.count() == 0 or not await checkbox.is_checked():
+                        print("尝试点击协议文本以确保勾选...")
+                        await label.click(force=True)
+                        await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"勾选协议尝试时忽略错误: {e}")
 
@@ -400,28 +415,51 @@ async def run_sign_in(account, config: dict):
                     # 2. 表单内的按钮
                     "form button:has-text('登录')",
                     "form button:has-text('Continue')",
-                    # 3. 排除 Header/Nav 的按钮 (通常 Header 按钮是 tertiary/borderless)
+                    "form button:has-text('继续')",
+                    # 3. 排除 Header/Nav 的按钮
+                    # 使用 :not(header *) 排除 header 内的按钮
+                    "button:not(header *):not(nav *):has-text('登录')",
+                    "button:not(header *):not(nav *):has-text('Continue')",
+                    "button:not(header *):not(nav *):has-text('继续')",
+                    # 4. 原有的一般性策略 (作为最后的兜底，但排除 borderless)
                     "button:not([class*='borderless']):has-text('登录')",
+                    "button:not([class*='borderless']):has-text('Sign in')",
                     "button:not([class*='borderless']):has-text('Continue')",
-                    # 4. 原有的一般性策略 (放在最后)
-                    "button:has-text('登录')",
-                    "button:has-text('Sign in')",
+                    "button:not([class*='borderless']):has-text('继续')",
                 ]
 
                 for selector in candidates:
                     try:
-                        loc = page.locator(selector).first
-                        if await loc.is_visible():
-                            # 检查是否被禁用（通常是因为未勾选协议）
-                            if await loc.is_disabled():
-                                print(f"发现登录按钮 ({selector}) 但被禁用，尝试再次勾选协议...")
-                                # 再次尝试勾选协议
-                                await page.locator("input[type='checkbox']").first.check(force=True)
-                                await asyncio.sleep(0.5)
-                            
-                            print(f"尝试点击登录按钮: {selector}")
-                            await loc.click(timeout=5000)
-                            return {"ok": True, "selector": selector}
+                        # 查找所有匹配的元素
+                        locs = await page.locator(selector).all()
+                        
+                        for loc in locs:
+                            if await loc.is_visible():
+                                # 检查是否被禁用（通常是因为未勾选协议）
+                                if await loc.is_disabled():
+                                    print(f"发现登录按钮 ({selector}) 但被禁用，尝试再次勾选协议...")
+                                    
+                                    # 针对 Semi UI 的再次尝试
+                                    # 先尝试点击 label（通常比较稳妥）
+                                    if await label.is_visible():
+                                        await label.click(force=True)
+                                        await asyncio.sleep(0.5)
+
+                                    if await loc.is_disabled():
+                                        # 如果还不行，尝试点击 Semi UI 的 checkbox 视觉元素
+                                        semi_inner = page.locator(".semi-checkbox-inner").first
+                                        if await semi_inner.is_visible():
+                                            await semi_inner.click(force=True)
+                                            await asyncio.sleep(0.5)
+                                
+                                # 再次检查禁用状态
+                                if await loc.is_disabled():
+                                    print(f"登录按钮 ({selector}) 仍然禁用，尝试下一个...")
+                                    continue
+
+                                print(f"尝试点击登录按钮: {selector}")
+                                await loc.click(timeout=5000)
+                                return {"ok": True, "selector": selector}
                     except Exception:
                         continue
                 
@@ -445,8 +483,17 @@ async def run_sign_in(account, config: dict):
             except Exception:
                 print(f"等待跳转超时，当前 URL: {page.url}")
                 if "/login" in page.url:
+                    # 尝试获取页面上的错误提示信息
+                    page_text = ""
+                    try:
+                        # 获取 body 文本，限制长度
+                        body_text = await page.evaluate("document.body.innerText")
+                        page_text = (body_text or "").strip()[:500].replace("\n", " ")
+                    except Exception:
+                        pass
+                    
                     artifacts = await dump_artifacts("login_stuck")
-                    raise RuntimeError(f"登录后停留在登录页，可能登录失败。{artifacts}")
+                    raise RuntimeError(f"登录后停留在登录页，可能登录失败。页面部分内容: [{page_text}] {artifacts}")
             
             # 尝试关闭系统公告弹窗
             try:
@@ -454,6 +501,10 @@ async def run_sign_in(account, config: dict):
                 close_selectors = [
                     "button[aria-label='Close']",
                     "button.ant-modal-close",
+                    # Semi UI 弹窗关闭按钮
+                    "button.semi-modal-close",
+                    "button.semi-button[aria-label='关闭']",
+                    # 通用
                     "button:has-text('我知道了')",
                     "button:has-text('关闭')", 
                     ".dialog-close"
